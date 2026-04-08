@@ -1,8 +1,8 @@
 """
-inference.py — Baseline agent for the Password Policy Environment.
+inference.py — Adaptive agent for the Password Policy Environment.
 
-Uses client.py (PasswordEnvClient) to interact with the environment.
-Uses the OpenAI SDK to drive the LLM agent.
+Phase 1: Systematic feature probing (one new feature per step)
+Phase 2: Reward-guided adaptation (LLM synthesises best candidate + mutates)
 
 Environment variables:
   API_BASE_URL   — LLM API endpoint (default: https://router.huggingface.co/v1)
@@ -26,14 +26,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_DIR  = os.path.join(BASE_DIR, "src", "envs", "my_env")
 
 def _load_module(name, filepath):
-    """Load a .py file as a named module by absolute path."""
     spec = importlib.util.spec_from_file_location(name, filepath)
     mod  = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod   # register BEFORE exec so cross-imports resolve
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
-# models.py must be loaded BEFORE client.py (client imports from models)
 models_mod = _load_module("models", os.path.join(ENV_DIR, "models.py"))
 client_mod = _load_module("client", os.path.join(ENV_DIR, "client.py"))
 
@@ -59,72 +57,99 @@ MAX_STEPS = 10
 
 llm = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
-# ── System prompt ──────────────────────────────────────────────────────────────
+# ── Phase 1: systematic feature probe sequence ─────────────────────────────────
+# Each step adds exactly ONE new feature so reward deltas are interpretable.
+PROBE_SEQUENCE = [
+    ("abc",           "baseline: short, lowercase only"),
+    ("abcdef",        "+length: 6 chars"),
+    ("Abcdef",        "+uppercase: capital first letter"),
+    ("Abcdef1",       "+digit: one digit appended"),
+    ("Abcdef1@",      "+symbol: one symbol appended"),
+    ("_Abcdef1@",     "+underscore start: leading underscore"),
+    ("_Abcde1@",      "length variant: 8 chars with underscore"),
+    ("_Abc1@X",       "variation: symbol mid, extra upper"),
+]
 
-SYSTEM_PROMPT = """You are an expert password generation agent in a black-box \
-optimisation environment.
+# ── System prompt for Phase 2 (adaptive) ──────────────────────────────────────
+
+ADAPTIVE_SYSTEM_PROMPT = """You are an expert password generation agent in a \
+black-box optimisation environment.
 
 TASK:
 Generate a password satisfying a completely hidden policy. After each attempt \
 you receive a reward score between 0.0 and 1.0. A score of 1.0 means all rules \
 are satisfied. You are NEVER told what the rules are.
 
-IMPORTANT RULES YOU MUST FOLLOW:
+IMPORTANT RULES:
 - Never repeat a password you have already submitted. Repeated passwords incur \
 a -0.30 penalty.
 - Each password must be a fresh, unique attempt.
 
-STRATEGY:
-1. First attempt: use a diverse password covering length ~6, mixed case, digit, \
-symbol (@#$%), starting with a letter or underscore.
-2. After each reward, reason about which aspect caused the score to change.
-3. Make one targeted change per attempt to isolate rule effects.
-4. Track what has and has not worked.
-5. Never repeat a previously submitted password.
-
-COMMON POLICY PATTERNS TO TEST:
-  - Length (5-7 chars)
-  - Uppercase + lowercase mix
-  - At least one digit, not all digits
-  - At least one symbol from @#$%, not all symbols
-  - First character: letter or underscore only
+STRATEGY — reward delta analysis:
+You will be given the full attempt history with reward scores.
+1. Find the step where reward jumped the most (largest positive delta).
+2. Identify WHICH single feature changed at that step — that feature is likely \
+required by the policy.
+3. Take the current best password and make ONE small targeted mutation to test \
+a new hypothesis (e.g. change length by 1, swap symbol, change case pattern).
+4. Never undo a feature that produced a positive delta.
+5. If reward is stuck, try: different symbol (@#$%), different length (5/6/7/8), \
+digit at start vs end, all-lowercase vs mixed case.
 
 OUTPUT FORMAT:
-Respond ONLY with a JSON object - no markdown, no explanation:
+Respond ONLY with a JSON object — no markdown, no explanation:
 {"password": "YourPasswordHere", "reasoning": "one line rationale"}
 """
 
 
-def build_prompt(obs: dict, step: int) -> str:
+def _build_adaptive_prompt(obs: dict, step: int) -> str:
+    """Build the user prompt for Phase 2 adaptive reasoning."""
     history = obs.get("history", [])
     lines   = []
-    for r in history:
-        dup = " [DUPLICATE - penalised]" if r.get("was_duplicate") else ""
+    for i, r in enumerate(history):
+        prev_reward = history[i - 1]["reward"] if i > 0 else 0.0
+        delta       = r["reward"] - prev_reward
+        delta_str   = f"Δ{delta:+.2f}" if i > 0 else "     "
+        dup         = " [DUPLICATE -0.30]" if r.get("was_duplicate") else ""
         lines.append(
-            f"  step={r['step']} password='{r['password']}' "
-            f"reward={r['reward']:.2f}{dup}"
+            f"  step={r['step']:>2}  reward={r['reward']:.2f}  {delta_str}"
+            f"  password='{r['password']}'{dup}"
         )
     history_str = "\n".join(lines) if lines else "  (no attempts yet)"
 
     return (
         f"Step {step} of {MAX_STEPS}\n"
-        f"Last password : '{obs.get('last_password', '')}'\n"
-        f"Last reward   : {obs.get('last_reward', 0.0):.2f}\n"
-        f"Best so far   : {obs.get('best_reward_so_far', 0.0):.2f}\n"
-        f"Steps left    : {obs.get('steps_remaining', 0)}\n\n"
-        f"Attempt history:\n{history_str}\n\n"
-        "What is your next password? Respond ONLY with the JSON object."
+        f"Best reward so far : {obs.get('best_reward_so_far', 0.0):.2f}\n"
+        f"Steps remaining    : {obs.get('steps_remaining', 0)}\n\n"
+        f"Full attempt history (with reward deltas):\n{history_str}\n\n"
+        "Analyse the deltas, identify which features help, and produce your "
+        "next password. Respond ONLY with the JSON object."
     )
 
 
-def get_agent_action(obs: dict, step: int) -> str:
-    """Call LLM, parse response, return password string."""
+# ── Agent decision logic ───────────────────────────────────────────────────────
+
+def get_agent_action(obs: dict, step: int, submitted: set) -> str:
+    """
+    Phase 1 (steps 1-8): return next probe password from PROBE_SEQUENCE.
+    Phase 2 (steps 9+):  call LLM with full delta-annotated history.
+    Falls back to a safe unique candidate if LLM fails or repeats.
+    """
+    # ── Phase 1: systematic probe ──────────────────────────────────────────────
+    probe_idx = step - 1
+    if probe_idx < len(PROBE_SEQUENCE):
+        candidate, _ = PROBE_SEQUENCE[probe_idx]
+        if candidate not in submitted:
+            return candidate
+        # If somehow already submitted (e.g. episode reuse), fall through
+
+    # ── Phase 2: LLM adaptive reasoning ───────────────────────────────────────
     try:
         resp = llm.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": build_prompt(obs, step)},
+                {"role": "system", "content": ADAPTIVE_SYSTEM_PROMPT},
+                {"role": "user",   "content": _build_adaptive_prompt(obs, step)},
             ],
             max_tokens=256,
             temperature=0.7,
@@ -135,16 +160,30 @@ def get_agent_action(obs: dict, step: int) -> str:
             raw   = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
         parsed = json.loads(raw)
         pw = str(parsed.get("password", "")).strip()
-        if pw:
+        if pw and pw not in submitted:
             return pw
+        # LLM returned a duplicate — fall through to safe fallback
     except Exception:
         pass
 
-    fallbacks = [
-        "_Abc1@", "_Dev2#", "_Run3$", "_Fix4%", "_Try5@",
-        "_Go6#",  "_Win7$", "_End8%", "_Set9@", "_Top1#",
+    # ── Safe unique fallback ───────────────────────────────────────────────────
+    # Mutate the best-seen password by tweaking length and symbol.
+    best_pw    = obs.get("last_password", "_Abc1@") or "_Abc1@"
+    symbols    = ["@", "#", "$", "%"]
+    base_cores = [
+        f"_Ab{step}@X", f"_Bc{step}#Y", f"_Cd{step}$Z",
+        f"_De{step}%W", f"_Ef{step}@V", f"_Fg{step}#U",
     ]
-    return fallbacks[min(step - 1, len(fallbacks) - 1)]
+    for core in base_cores:
+        if core not in submitted:
+            return core
+    # Last resort: suffix the step number to the best password
+    for sym in symbols:
+        candidate = f"{best_pw[:5]}{step}{sym}"
+        if candidate not in submitted:
+            return candidate
+
+    return f"_Z{step}a1@"
 
 
 # ── Episode runner ─────────────────────────────────────────────────────────────
@@ -154,6 +193,7 @@ def run_episode(task: str, person_id: str) -> None:
     steps_taken: int         = 0
     success:     bool        = False
     error_msg:   str         = "null"
+    submitted:   set         = set()   # track submitted passwords this episode
 
     print(
         f"[START] task={task} env=password-policy-env model={MODEL_NAME}",
@@ -167,10 +207,12 @@ def run_episode(task: str, person_id: str) -> None:
 
             for step in range(1, MAX_STEPS + 1):
                 try:
-                    password  = get_agent_action(obs, step)
+                    password  = get_agent_action(obs, step, submitted)
+                    submitted.add(password)
                     error_msg = "null"
                 except Exception as e:
-                    password  = "_Fallback1@"
+                    password  = f"_Fb{step}@1"
+                    submitted.add(password)
                     error_msg = str(e).replace("\n", " ")
 
                 try:
@@ -215,5 +257,5 @@ def run_episode(task: str, person_id: str) -> None:
 
 if __name__ == "__main__":
     for task in TASKS:
-        run_episode(task=task, person_id=f"baseline_agent_{task}")
+        run_episode(task=task, person_id=f"adaptive_agent_{task}")
         print(flush=True)
