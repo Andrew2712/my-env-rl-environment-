@@ -1,4 +1,13 @@
-﻿# Password Policy Environment
+﻿---
+title: My Env
+emoji: 🔐
+colorFrom: blue
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
+# Password Policy Environment
 
 **OpenEnv Hackathon Submission** | Tag: `openenv`
 
@@ -38,7 +47,6 @@ my_env/
 │   └── Dockerfile     ← Container definition
 ├── inference.py       ← Baseline agent (OpenAI SDK + client.py)
 ├── openenv.yaml       ← OpenEnv manifest
-├── pyproject.toml     ← Package metadata
 └── requirements.txt   ← Pinned dependencies
 ```
 
@@ -67,7 +75,7 @@ If a duplicate password is detected for the same person:
 reward = max(0.0, raw_reward − 0.30)
 ```
 
-### Corrected Reward Table
+### Reward Table
 
 | Password | len | r1 | r2 | r3 | r4 | r5 | **Total** | Note |
 |---|---|---|---|---|---|---|---|---|
@@ -122,11 +130,11 @@ Time complexity: O((n/k) log(n/k)) parallel + O(n log k) merge, where k = worker
   "last_reward": 1.0,
   "best_reward_so_far": 1.0,
   "history": [
-    {"step": 1, "password": "hello",   "reward": 0.50, "was_duplicate": false},
-    {"step": 2, "password": "HELLO123","reward": 0.66, "was_duplicate": false},
-    {"step": 3, "password": "Hello1@", "reward": 1.00, "was_duplicate": false}
+    {"step": 1, "password": "hello",    "reward": 0.50, "was_duplicate": false},
+    {"step": 2, "password": "HELLO123", "reward": 0.66, "was_duplicate": false},
+    {"step": 3, "password": "Hello1@",  "reward": 1.00, "was_duplicate": false}
   ],
-  "message": "✓ Perfect score! All policy rules satisfied."
+  "message": "Perfect score! All policy rules satisfied."
 }
 ```
 
@@ -185,7 +193,6 @@ curl -X POST http://localhost:7860/reset \
 curl -X POST http://localhost:7860/step \
      -H "Content-Type: application/json" \
      -d '{"person_id":"agent_001","password":"_Abc1@"}'
-# Expected: reward=1.0, done=true
 curl http://localhost:7860/registry
 ```
 
