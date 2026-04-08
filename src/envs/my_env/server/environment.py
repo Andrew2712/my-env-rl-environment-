@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import sys
 import os
+import json
 import hashlib
 import string
 import threading
@@ -169,68 +170,137 @@ def hash_password(password: str) -> str:
 
 class PasswordRegistry:
     """
-    Thread-safe registry mapping person_id → sorted list of hashed passwords.
+    Thread-safe, file-persisted registry.
+
+    Maps person_id → sorted list of SHA-256 hex hashes.
+
+    Storage layout (JSON file):
+    {
+        "agent_001": ["0a1b2c...", "3d4e5f...", ...],
+        "agent_002": ["7f8a9b...", ...]
+    }
+
+    All keys are SHA-256 hashes — no plaintext is ever written.
+    The file is read on __init__ and written atomically on every
+    register() call using a temp-file + os.replace() pattern,
+    so a crash mid-write never corrupts existing data.
 
     Operations:
       is_duplicate(person_id, password) → bool   [O(log n), binary search]
-      register(person_id, password)     → None    [O(n log n), parallel sort]
+      register(person_id, password)     → None    [O(n log n), parallel sort + file write]
       person_count(person_id)           → int
       total_stored()                    → int
     """
 
-    def __init__(self) -> None:
-        # person_id → sorted list of SHA-256 hex hashes
-        self._store: dict[str, list[str]] = {}
+    # Default path: written next to this file inside server/
+    DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "registry.json")
+
+    def __init__(self, storage_path: str | None = None) -> None:
+        self._path  = storage_path or self.DEFAULT_PATH
         self._lock  = threading.Lock()
+        self._store: dict[str, list[str]] = self._load()
+
+    # ── Persistence helpers ───────────────────────────────────────
+
+    def _load(self) -> dict[str, list[str]]:
+        """
+        Load registry from JSON file at startup.
+        Returns an empty dict if the file does not exist yet
+        (first run) or is malformed.
+        """
+        if not os.path.exists(self._path):
+            return {}
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Validate structure: must be dict[str, list[str]]
+            if isinstance(data, dict):
+                return {
+                    k: v for k, v in data.items()
+                    if isinstance(k, str) and isinstance(v, list)
+                }
+        except (json.JSONDecodeError, OSError):
+            pass
+        return {}
+
+    def _save(self) -> None:
+        """
+        Write the current in-memory store to disk atomically.
+
+        Uses temp-file + os.replace():
+          1. Write to registry.json.tmp
+          2. os.replace() swaps it in atomically
+        This guarantees the file is never left in a half-written state.
+
+        Called inside the lock — caller must hold self._lock.
+        """
+        tmp_path = self._path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._store, f, indent=2)
+            os.replace(tmp_path, self._path)     # atomic on POSIX and Windows
+        except OSError as e:
+            # Non-fatal: in-memory state remains correct.
+            # Log the error but do not crash the environment.
+            print(
+                f"[PasswordRegistry] WARNING: could not save registry to "
+                f"{self._path}: {e}",
+                flush=True,
+            )
+
+    # ── Public API ────────────────────────────────────────────────
 
     def is_duplicate(self, person_id: str, password: str) -> bool:
         """
         Check if this person has already successfully submitted this password.
 
-        Steps:
-          1. Hash the plaintext password (SHA-256)
-          2. Retrieve the person's sorted hash list
-          3. Run binary search — O(log n)
+        1. Hash plaintext → SHA-256 hex
+        2. Retrieve person's sorted hash list (from memory, not disk)
+        3. Binary search — O(log n)
         """
         pw_hash = hash_password(password)
         with self._lock:
-            history = self._store.get(person_id, [])
-        # Binary search on sorted hash list
+            history = list(self._store.get(person_id, []))
         return binary_search(history, pw_hash)
 
     def register(self, person_id: str, password: str) -> None:
         """
-        Store a successfully submitted password for a person.
+        Store a successful password hash for a person.
 
-        Steps:
-          1. Hash the plaintext password
-          2. Append to person's list
-          3. Re-sort using parallel_merge_sort to maintain sorted order
-             (required for binary search to remain correct)
+        1. Hash plaintext → SHA-256 hex
+        2. Append to person's in-memory list
+        3. Re-sort using parallel_merge_sort (keeps binary search valid)
+        4. Write entire registry to registry.json atomically
 
-        Idempotent — calling register() with the same password twice
-        is safe (is_duplicate() prevents double-registration from
-        the environment, but the sort is stable regardless).
+        Idempotent — re-registering the same password is safe.
+        is_duplicate() is called upstream to prevent it, but _save()
+        is stable regardless.
         """
         pw_hash = hash_password(password)
         with self._lock:
             current = self._store.get(person_id, [])
             current.append(pw_hash)
-            # Re-sort via parallel merge sort
             self._store[person_id] = parallel_merge_sort(current)
+            self._save()    # ← persist to disk inside the lock
 
     def person_count(self, person_id: str) -> int:
-        """Number of unique passwords stored for this person."""
+        """Number of unique hashed passwords stored for this person."""
         with self._lock:
             return len(self._store.get(person_id, []))
 
     def total_stored(self) -> int:
-        """Total number of hashed passwords across all persons."""
+        """Total hashed passwords across all persons."""
         with self._lock:
             return sum(len(v) for v in self._store.values())
 
+    @property
+    def storage_path(self) -> str:
+        """Absolute path of the JSON registry file."""
+        return os.path.abspath(self._path)
 
-# Singleton registry — shared across all episodes on this server process
+
+# Singleton registry — shared across all episodes on this server process.
+# Loads any previously stored hashes from registry.json on startup.
 _REGISTRY = PasswordRegistry()
 
 
@@ -621,6 +691,7 @@ class PasswordPolicyEnvironment:
             "history":               [r.model_dump() for r in self._history],
             "registry_size":         _REGISTRY.total_stored(),
             "person_password_count": _REGISTRY.person_count(self._person_id),
+            "registry_storage_path": _REGISTRY.storage_path,
             "policy_hint":           "Hidden — agent must infer from reward signal only.",
         }
 

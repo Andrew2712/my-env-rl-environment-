@@ -1,5 +1,19 @@
 """
 inference.py — Baseline agent for the Password Policy Environment.
+
+Uses client.py (PasswordEnvClient) to interact with the environment.
+Uses the OpenAI SDK to drive the LLM agent.
+
+Environment variables:
+  API_BASE_URL   — LLM API endpoint (default: https://router.huggingface.co/v1)
+  MODEL_NAME     — model identifier  (default: Qwen/Qwen2.5-72B-Instruct)
+  HF_TOKEN       — Hugging Face bearer token
+  ENV_BASE_URL   — Password env server URL (default: http://localhost:7860)
+
+stdout format (mandatory — zero deviation):
+  [START] task=<name> env=password-policy-env model=<model>
+  [STEP]  step=<n> action=<password> reward=<0.00> done=<true|false> error=<msg|null>
+  [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
 """
 
 import os

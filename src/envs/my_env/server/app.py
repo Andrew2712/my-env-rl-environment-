@@ -175,8 +175,10 @@ def registry():
         "registry_size":         s["registry_size"],
         "person_password_count": s["person_password_count"],
         "current_person_id":     s["person_id"],
+        "registry_storage_path": s.get("registry_storage_path", "unknown"),
         "storage_note":          (
             "All passwords stored as SHA-256 hashes only. "
+            "Persisted to registry.json on every successful registration. "
             "Sorted via parallel merge sort for O(log n) binary search."
         ),
     }
