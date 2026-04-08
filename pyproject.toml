@@ -1,0 +1,20 @@
+[project]
+name = "my-env"
+version = "0.1.0"
+description = "Password policy RL environment"
+authors = [{ name = "Andrew" }]
+dependencies = [
+    "openenv-core>=0.2.0",
+    "fastapi",
+    "uvicorn"
+]
+
+[project.scripts]
+server = "server.app:main"
+
+[tool.setuptools]
+packages = ["src"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
