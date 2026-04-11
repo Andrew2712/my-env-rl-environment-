@@ -1,42 +1,25 @@
 name: password-policy-env
 version: 1.0.0
-description: >
-  Black-box password generation environment. The agent must discover
-  a hidden 5-rule password policy purely through reward signal feedback.
+description: Black-box password generation environment.
 
 tasks:
   - id: easy
     name: validate_password
-    description: >
-      A starting password is provided. Evaluate it and try to improve
-      it against the hidden policy.
+    description: Evaluate and improve a starting password against the hidden policy.
     score_range:
       min: 0.001
       max: 0.999
 
   - id: medium
     name: fix_password
-    description: >
-      A non-compliant password is given. Fix it iteratively using only
-      the reward signal as guidance.
+    description: Fix a non-compliant password iteratively using reward signal.
     score_range:
       min: 0.001
       max: 0.999
 
   - id: hard
     name: generate_compliant_password
-    description: >
-      No starting password. Generate a fully policy-compliant password
-      from scratch using reward signal feedback only.
-      Repeated passwords incur a penalty.
+    description: Generate a compliant password from scratch using reward signal only.
     score_range:
       min: 0.001
       max: 0.999
-
-environment:
-  type: docker
-  endpoint: http://localhost:7860
-  health_check: /health
-  reset_endpoint: /reset
-  step_endpoint: /step
-  state_endpoint: /state
