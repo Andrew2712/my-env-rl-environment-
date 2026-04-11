@@ -34,6 +34,10 @@ ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "http://localhost:7860")
 TASKS = ["easy", "medium", "hard"]
 MAX_STEPS = 10
 
+# Reward bounds — task validator requires strictly (0, 1)
+REWARD_MIN = 0.001
+REWARD_MAX = 0.999
+
 if not API_BASE_URL or not API_KEY:
     print("[ERROR] API_BASE_URL or API_KEY environment variable is missing!", flush=True)
 
@@ -72,7 +76,7 @@ def get_env_client():
         raise RuntimeError(f"Could not import PasswordEnvClient: {e}")
 
 
-# ── System Prompt (unchanged) ────────────────────────────────────────────────
+# ── System Prompt ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a password policy inference agent. Your job is to \
 discover a hidden password policy through trial and error using reward feedback.
 REWARD: A score 0.0-1.0. Each of 5 rules contributes 0.20.
@@ -231,7 +235,7 @@ def get_agent_action(obs: dict, step: int, episode_history: list, llm) -> tuple[
 
         print(f"[WARN] All LLM attempts failed. Last error: {last_llm_error}. Using fallback.", flush=True)
 
-    # ── Smart fallback (your original logic kept) ─────────────────────────────
+    # ── Smart fallback ────────────────────────────────────────────────────────
     best_entry = max(episode_history, key=lambda h: h["reward"]) if episode_history else None
     best_pw = best_entry["password"] if best_entry else "Ab1@xy"
     symbols = ["@", "#", "$", "%"]
@@ -275,7 +279,15 @@ def get_agent_action(obs: dict, step: int, episode_history: list, llm) -> tuple[
             return pw, "fallback-random"
 
 
-# ── Episode runner (your original logic kept) ────────────────────────────────
+def clamp_reward(reward: float) -> float:
+    """
+    Clamp reward to strictly (0, 1) exclusive.
+    The task validator rejects scores of exactly 0.0 or 1.0.
+    """
+    return max(REWARD_MIN, min(REWARD_MAX, float(reward)))
+
+
+# ── Episode runner ────────────────────────────────────────────────────────────
 def run_episode(task: str, person_id: str, llm) -> None:
     rewards: list[float] = []
     steps_taken: int = 0
@@ -315,27 +327,31 @@ def run_episode(task: str, person_id: str, llm) -> None:
 
                 was_dup = obs.get("history", [{}])[-1].get("was_duplicate", False) if obs.get("history") else False
 
+                # Clamp reward to strictly (0, 1) for task validator compliance
+                clamped_reward = clamp_reward(reward)
+
                 episode_history.append({
                     "step": step,
                     "password": password,
-                    "reward": reward,
+                    "reward": reward,          # keep raw reward for internal logic
                     "was_duplicate": was_dup,
                     "source": action_source,
                 })
 
-                rewards.append(reward)
+                rewards.append(clamped_reward)  # clamped reward goes into final output
                 steps_taken = step
                 done_str = "true" if done else "false"
 
                 print(
                     f"[STEP] step={step} action={password} "
-                    f"reward={reward:.2f} done={done_str} error={error_msg}",
+                    f"reward={clamped_reward:.2f} done={done_str} error={error_msg}",
                     flush=True,
                 )
 
                 if done:
                     success = (reward >= 1.0)
                     break
+
     except Exception as e:
         error_msg = str(e).replace("\n", " ")
         success = False
@@ -348,7 +364,7 @@ def run_episode(task: str, person_id: str, llm) -> None:
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"[INFO] Starting inference | MODEL={MODEL_NAME} | API_BASE_URL={API_BASE_URL[:60] if API_BASE_URL else 'MISSING'}...", flush=True)
-    
+
     llm = make_llm()
 
     for task in TASKS:
