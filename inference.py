@@ -381,7 +381,7 @@ def run_episode(task: str, person_id: str, llm) -> None:
         error_msg = str(e).replace("\n", " ")
         success   = False
 
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    rewards_str = ",".join(f"{r:.3f}" for r in rewards)
     success_str = "true" if success else "false"
     print(
         f"[END] success={success_str} steps={steps_taken} rewards={rewards_str}",
