@@ -331,16 +331,21 @@ def run_episode(task: str, person_id: str, llm) -> None:
                         error_msg     = str(e).replace("\n", " ")
 
                     try:
-                        obs_obj, reward, done, info = env.step(
+                        obs_obj, reward_obj, done, info = env.step(
                             person_id=person_id,
                             password=password,
                         )
                         obs       = obs_obj.model_dump()
+                        # Extract float value from Reward object if needed
+                        reward    = reward_obj.value if hasattr(reward_obj, "value") else float(reward_obj)
                         error_msg = "null"
                     except Exception as e:
-                        reward    = 0.0
+                        reward    = 0.001
                         done      = True
                         error_msg = str(e).replace("\n", " ")
+
+                    # Clamp to strictly (0.001, 0.999) as required by validator
+                    reward = round(max(0.001, min(0.999, reward)), 4)
 
                     was_dup = (
                         obs.get("history", [{}])[-1].get("was_duplicate", False)
@@ -365,7 +370,7 @@ def run_episode(task: str, person_id: str, llm) -> None:
                     )
 
                     if done:
-                        success = (reward >= 1.0)
+                        success = (reward >= 0.999)
                         break
 
             except Exception as e:
