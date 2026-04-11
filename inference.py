@@ -27,40 +27,42 @@ sys.path.insert(0, ENV_DIR)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 API_BASE_URL = os.environ.get("API_BASE_URL")
-API_KEY = os.environ.get("API_KEY")
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+API_KEY      = os.environ.get("API_KEY")
+MODEL_NAME   = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "http://localhost:7860")
 
-TASKS = ["easy", "medium", "hard"]
+TASKS    = ["easy", "medium", "hard"]
 MAX_STEPS = 10
 
-# Reward bounds — task validator requires strictly (0, 1)
+# Reward bounds — task validator requires strictly (0, 1) exclusive
 REWARD_MIN = 0.001
 REWARD_MAX = 0.999
 
 if not API_BASE_URL or not API_KEY:
     print("[ERROR] API_BASE_URL or API_KEY environment variable is missing!", flush=True)
 
+
+def _clamp(value: float) -> float:
+    """Clamp any reward/score to strictly (0, 1) exclusive."""
+    return max(REWARD_MIN, min(REWARD_MAX, float(value)))
+
+
 # ── OpenAI client for hackathon proxy ────────────────────────────────────────
 def make_llm():
     if not API_BASE_URL or not API_KEY:
         print("[WARN] LLM disabled - missing API_BASE_URL or API_KEY", flush=True)
         return None
-
     try:
         from openai import OpenAI
-
         base_url = API_BASE_URL.rstrip("/")
         if not base_url.endswith("/v1"):
             base_url += "/v1"
-
         client = OpenAI(
             base_url=base_url,
             api_key=API_KEY,
             timeout=60.0,
             max_retries=2,
         )
-
         print(f"[INFO] LLM client initialized successfully | base_url={base_url} | model={MODEL_NAME}", flush=True)
         return client
     except Exception as e:
@@ -109,7 +111,6 @@ CRITICAL OUTPUT RULES:
 
 
 def build_prompt(obs: dict, step: int, episode_history: list) -> str:
-    """Build a rich prompt showing the full reward trajectory."""
     lines = []
     for i, h in enumerate(episode_history):
         prev_r = episode_history[i-1]["reward"] if i > 0 else None
@@ -128,12 +129,12 @@ def build_prompt(obs: dict, step: int, episode_history: list) -> str:
             f" step={h['step']:2d} pw='{h['password']}' "
             f"reward={h['reward']:.2f}{trend}{dup}"
         )
-    history_str = "\n".join(lines) if lines else " (none yet)"
-    best = obs.get("best_reward_so_far", 0.0)
-    last_r = obs.get("last_reward", 0.0)
-    left = obs.get("steps_remaining", 0)
-    last_pw = obs.get("last_password", "")
-    best_entry = max(episode_history, key=lambda h: h["reward"]) if episode_history else None
+    history_str  = "\n".join(lines) if lines else " (none yet)"
+    best         = obs.get("best_reward_so_far", 0.0)
+    last_r       = obs.get("last_reward", 0.0)
+    left         = obs.get("steps_remaining", 0)
+    last_pw      = obs.get("last_password", "")
+    best_entry   = max(episode_history, key=lambda h: h["reward"]) if episode_history else None
     best_pw_info = (
         f"Best password so far: '{best_entry['password']}' (reward={best_entry['reward']:.2f})"
         if best_entry else "No attempts yet"
@@ -153,7 +154,7 @@ def build_prompt(obs: dict, step: int, episode_history: list) -> str:
     else:
         hint = f"{rules_left} rules left. Keep isolating changes. Always start from your best password."
     dup_warning = obs.get("_duplicate_warning", "")
-    dup_section = f"\nWARNING: {dup_warning}\n" if dup_warning else ""
+    dup_section  = f"\nWARNING: {dup_warning}\n" if dup_warning else ""
     submitted_list = [h["password"] for h in episode_history]
     return (
         f"=== Step {step}/{MAX_STEPS} | Steps left: {left} ===\n\n"
@@ -172,7 +173,6 @@ def build_prompt(obs: dict, step: int, episode_history: list) -> str:
 
 
 def clean_llm_response(raw: str) -> dict:
-    """Robustly extract JSON from LLM output."""
     raw = raw.strip()
     if raw.startswith("```"):
         parts = raw.split("```")
@@ -182,37 +182,34 @@ def clean_llm_response(raw: str) -> dict:
                 raw = cleaned
                 break
     brace_start = raw.find("{")
-    brace_end = raw.rfind("}")
+    brace_end   = raw.rfind("}")
     if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
         raw = raw[brace_start : brace_end + 1]
     return json.loads(raw)
 
 
 def get_agent_action(obs: dict, step: int, episode_history: list, llm) -> tuple[str, str]:
-    submitted = {h["password"] for h in episode_history}
+    submitted   = {h["password"] for h in episode_history}
     current_obs = obs
 
-    # ── LLM path (up to 3 retries) ────────────────────────────────────────────
     if llm is not None:
         last_llm_error = None
         for attempt in range(3):
             try:
                 prompt = build_prompt(current_obs, step, episode_history)
-
-                resp = llm.chat.completions.create(
+                resp   = llm.chat.completions.create(
                     model=MODEL_NAME,
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
+                        {"role": "user",   "content": prompt},
                     ],
                     max_tokens=500,
                     temperature=0.3 + attempt * 0.1,
                     timeout=45.0,
                 )
-
-                raw = resp.choices[0].message.content.strip()
+                raw    = resp.choices[0].message.content.strip()
                 parsed = clean_llm_response(raw)
-                pw = str(parsed.get("password", "")).strip()
+                pw     = str(parsed.get("password", "")).strip()
 
                 if not pw:
                     last_llm_error = "LLM returned empty password"
@@ -237,9 +234,9 @@ def get_agent_action(obs: dict, step: int, episode_history: list, llm) -> tuple[
 
     # ── Smart fallback ────────────────────────────────────────────────────────
     best_entry = max(episode_history, key=lambda h: h["reward"]) if episode_history else None
-    best_pw = best_entry["password"] if best_entry else "Ab1@xy"
-    symbols = ["@", "#", "$", "%"]
-    lengths = [5, 6, 7, 8]
+    best_pw    = best_entry["password"] if best_entry else "Ab1@xy"
+    symbols    = ["@", "#", "$", "%"]
+    lengths    = [5, 6, 7, 8]
     fallback_candidates = []
 
     for sym in symbols:
@@ -266,7 +263,6 @@ def get_agent_action(obs: dict, step: int, episode_history: list, llm) -> tuple[
         if pw not in submitted:
             return pw, "fallback"
 
-    # Random fallback if all else fails
     while True:
         pw = (
             random.choice(string.ascii_uppercase) +
@@ -279,21 +275,13 @@ def get_agent_action(obs: dict, step: int, episode_history: list, llm) -> tuple[
             return pw, "fallback-random"
 
 
-def clamp_reward(reward: float) -> float:
-    """
-    Clamp reward to strictly (0, 1) exclusive.
-    The task validator rejects scores of exactly 0.0 or 1.0.
-    """
-    return max(REWARD_MIN, min(REWARD_MAX, float(reward)))
-
-
 # ── Episode runner ────────────────────────────────────────────────────────────
 def run_episode(task: str, person_id: str, llm) -> None:
-    rewards: list[float] = []
-    steps_taken: int = 0
-    success: bool = False
-    error_msg: str = "null"
-    episode_history: list = []
+    rewards:      list[float] = []
+    steps_taken:  int         = 0
+    success:      bool        = False
+    error_msg:    str         = "null"
+    episode_history: list     = []
 
     print(f"[START] task={task} env=password-policy-env model={MODEL_NAME}", flush=True)
 
@@ -306,64 +294,70 @@ def run_episode(task: str, person_id: str, llm) -> None:
     try:
         with PasswordEnvClient(base_url=ENV_BASE_URL) as env:
             obs_obj = env.reset(task=task, person_id=person_id)
-            obs = obs_obj.model_dump()
+            obs     = obs_obj.model_dump()
 
             for step in range(1, MAX_STEPS + 1):
                 try:
                     password, action_source = get_agent_action(obs, step, episode_history, llm)
                 except Exception as e:
-                    password = "Ab1@xy"
+                    password      = "Ab1@xy"
                     action_source = "exception-fallback"
-                    error_msg = str(e).replace("\n", " ")
+                    error_msg     = str(e).replace("\n", " ")
 
                 try:
                     obs_obj, reward, done, info = env.step(person_id=person_id, password=password)
-                    obs = obs_obj.model_dump()
+                    obs       = obs_obj.model_dump()
                     error_msg = "null"
                 except Exception as e:
-                    reward = 0.0
-                    done = True
+                    reward    = 0.0
+                    done      = True
                     error_msg = str(e).replace("\n", " ")
+
+                # Get raw float reward value
+                raw_reward = reward.value if hasattr(reward, "value") else float(reward)
 
                 was_dup = obs.get("history", [{}])[-1].get("was_duplicate", False) if obs.get("history") else False
 
-                # Clamp reward to strictly (0, 1) for task validator compliance
-                clamped_reward = clamp_reward(reward)
-
                 episode_history.append({
-                    "step": step,
-                    "password": password,
-                    "reward": reward,          # keep raw reward for internal logic
+                    "step":          step,
+                    "password":      password,
+                    "reward":        raw_reward,   # raw for internal reasoning
                     "was_duplicate": was_dup,
-                    "source": action_source,
+                    "source":        action_source,
                 })
 
-                rewards.append(clamped_reward)  # clamped reward goes into final output
+                # Clamp for all output — validator rejects exactly 0.0 or 1.0
+                clamped_reward = _clamp(raw_reward)
+                rewards.append(clamped_reward)
                 steps_taken = step
-                done_str = "true" if done else "false"
+                done_str    = "true" if done else "false"
 
                 print(
                     f"[STEP] step={step} action={password} "
-                    f"reward={clamped_reward:.2f} done={done_str} error={error_msg}",
+                    f"reward={clamped_reward:.3f} done={done_str} error={error_msg}",
                     flush=True,
                 )
 
                 if done:
-                    success = (reward >= 1.0)
+                    success = (raw_reward >= 0.999)
                     break
 
     except Exception as e:
         error_msg = str(e).replace("\n", " ")
-        success = False
+        success   = False
 
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    success_str = "true" if success else "false"
+    rewards_str  = ",".join(f"{r:.3f}" for r in rewards)
+    success_str  = "true" if success else "false"
     print(f"[END] success={success_str} steps={steps_taken} rewards={rewards_str}", flush=True)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print(f"[INFO] Starting inference | MODEL={MODEL_NAME} | API_BASE_URL={API_BASE_URL[:60] if API_BASE_URL else 'MISSING'}...", flush=True)
+    print(
+        f"[INFO] Starting inference | MODEL={MODEL_NAME} | "
+        f"API_BASE_URL={API_BASE_URL[:60] if API_BASE_URL else 'MISSING'}...",
+        flush=True,
+    )
 
     llm = make_llm()
 
