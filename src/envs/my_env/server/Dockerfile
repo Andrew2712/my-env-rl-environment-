@@ -1,7 +1,7 @@
 # ── Base image ─────────────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-# ── Environment ─────────────────────────────────────────────────────────────────
+# ── Environment variables ──────────────────────────────────────────────────────
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=7860
@@ -9,31 +9,26 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # ── Working directory ───────────────────────────────────────────────────────────
 WORKDIR /app
 
-# ── Install dependencies ────────────────────────────────────────────────────────
-# requirements.txt is at project root — copy it first for layer caching
+# ── Install dependencies first (better caching) ────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Copy project ─────────────────────────────────────────────────────────────────
-# Copy models.py and client.py (project root level)
-COPY models.py    .
-COPY client.py    .
-COPY openenv.yaml .
-COPY README.md    .
+# ── Copy application files ──────────────────────────────────────────────────────
 COPY inference.py .
+COPY models.py .
+COPY client.py .
+COPY openenv.yaml .
+COPY README.md .
 
-# Copy server package
-COPY server/      ./server/
+# Copy the entire server directory (important: trailing slash)
+COPY server/ ./server/
 
-# ── Expose port (HF Spaces requires 7860) ───────────────────────────────────────
+# ── Expose port (required for HF Spaces) ────────────────────────────────────────
 EXPOSE 7860
 
-# ── Health check ─────────────────────────────────────────────────────────────────
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-  CMD python -c \
-  "import requests; requests.get('http://localhost:7860/health').raise_for_status()"
+# ── Health check (improved) ─────────────────────────────────────────────────────
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=5 \
+  CMD python -c "import requests; requests.get('http://localhost:7860/health', timeout=5).raise_for_status()" || exit 1
 
-# ── Launch ────────────────────────────────────────────────────────────────────────
-# --workers 1: environment has shared singleton registry state.
-# Multiple workers would split the registry across processes.
+# ── Run the app ─────────────────────────────────────────────────────────────────
 CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1"]
