@@ -41,20 +41,17 @@ from models import (
 
 
 # ═════════════════════════════════════════════════════════════════
-# REWARD CLAMPING HELPER
-# Task validator requires scores strictly in (0, 1) — never 0.0 or 1.0
-# ═════════════════════════════════════════════════════════════════
-
-def _clamp(value: float) -> float:
-    """Clamp a score to strictly (0, 1) exclusive."""
-    return max(0.001, min(0.999, float(value)))
-
-
-# ═════════════════════════════════════════════════════════════════
 # REQUIREMENT 4 — PARALLEL MERGE SORT + BINARY SEARCH
+# Used by PasswordRegistry to maintain a sorted list of hashed
+# passwords and search it efficiently.
 # ═════════════════════════════════════════════════════════════════
 
 def _merge(left: list[str], right: list[str]) -> list[str]:
+    """
+    Standard two-pointer merge of two sorted lists.
+    Operates on SHA-256 hex strings — lexicographic order is correct
+    for hash comparison because hex chars are uniform in distribution.
+    """
     result: list[str] = []
     i = j = 0
     while i < len(left) and j < len(right):
@@ -70,6 +67,10 @@ def _merge(left: list[str], right: list[str]) -> list[str]:
 
 
 def _merge_sort_sequential(arr: list[str]) -> list[str]:
+    """
+    Standard recursive merge sort — used for small chunks inside
+    parallel workers (avoids spawning threads within threads).
+    """
     if len(arr) <= 1:
         return arr
     mid   = len(arr) // 2
@@ -79,11 +80,31 @@ def _merge_sort_sequential(arr: list[str]) -> list[str]:
 
 
 def parallel_merge_sort(arr: list[str], max_workers: int = 4) -> list[str]:
+    """
+    Parallel merge sort using ThreadPoolExecutor.
+
+    Strategy:
+      1. Split the input list into `max_workers` roughly equal chunks.
+      2. Sort each chunk concurrently in a thread pool.
+      3. Sequentially merge all sorted chunks back into one sorted list.
+
+    Why threads (not processes): GIL is acceptable here because
+    the workload is comparison-heavy (pure Python string ops), not
+    CPU-bound computation. For very large lists, switch to
+    multiprocessing.Pool with picklable data.
+
+    Time complexity: O((n/k) log(n/k)) per thread × O(n log k) merge
+    where k = max_workers.
+    """
     if len(arr) <= 1:
         return list(arr)
+
+    # Split into chunks — cap at actual list length
     k          = min(max_workers, len(arr))
     chunk_size = max(1, len(arr) // k)
     chunks     = [arr[i : i + chunk_size] for i in range(0, len(arr), chunk_size)]
+
+    # Sort each chunk in a separate thread
     sorted_chunks: list[list[str]] = [[] for _ in chunks]
     with ThreadPoolExecutor(max_workers=k) as executor:
         future_to_idx = {
@@ -93,13 +114,21 @@ def parallel_merge_sort(arr: list[str], max_workers: int = 4) -> list[str]:
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
             sorted_chunks[idx] = future.result()
+
+    # Sequential k-way merge
     result = sorted_chunks[0]
     for chunk in sorted_chunks[1:]:
         result = _merge(result, chunk)
+
     return result
 
 
 def binary_search(sorted_arr: list[str], target: str) -> bool:
+    """
+    Binary search on a sorted list of SHA-256 hex strings.
+    Returns True if target is found, False otherwise.
+    O(log n) — efficient for large registries.
+    """
     lo, hi = 0, len(sorted_arr) - 1
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -117,14 +146,53 @@ def binary_search(sorted_arr: list[str], target: str) -> bool:
 # ═════════════════════════════════════════════════════════════════
 
 def hash_password(password: str) -> str:
+    """
+    Hash a password using SHA-256.
+
+    SHA-256 is used here because:
+      - It is deterministic (same input → same hash always, required
+        for duplicate detection)
+      - It is available in Python stdlib (hashlib) — no dependencies
+      - It produces a fixed 64-char hex string suitable for sorting
+
+    For production auth systems, use bcrypt or Argon2 with a salt.
+    This environment uses SHA-256 because the goal is duplicate
+    detection across submissions, not authentication security.
+    """
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
 # ═════════════════════════════════════════════════════════════════
 # REQUIREMENTS 1 & 2 — PASSWORD REGISTRY
+# One unique password per person. Stores hashed successes.
+# Uses parallel merge sort to maintain sorted storage.
 # ═════════════════════════════════════════════════════════════════
 
 class PasswordRegistry:
+    """
+    Thread-safe, file-persisted registry.
+
+    Maps person_id → sorted list of SHA-256 hex hashes.
+
+    Storage layout (JSON file):
+    {
+        "agent_001": ["0a1b2c...", "3d4e5f...", ...],
+        "agent_002": ["7f8a9b...", ...]
+    }
+
+    All keys are SHA-256 hashes — no plaintext is ever written.
+    The file is read on __init__ and written atomically on every
+    register() call using a temp-file + os.replace() pattern,
+    so a crash mid-write never corrupts existing data.
+
+    Operations:
+      is_duplicate(person_id, password) → bool   [O(log n), binary search]
+      register(person_id, password)     → None    [O(n log n), parallel sort + file write]
+      person_count(person_id)           → int
+      total_stored()                    → int
+    """
+
+    # Default path: written next to this file inside server/
     DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "registry.json")
 
     def __init__(self, storage_path: str | None = None) -> None:
@@ -132,12 +200,20 @@ class PasswordRegistry:
         self._lock  = threading.Lock()
         self._store: dict[str, list[str]] = self._load()
 
+    # ── Persistence helpers ───────────────────────────────────────
+
     def _load(self) -> dict[str, list[str]]:
+        """
+        Load registry from JSON file at startup.
+        Returns an empty dict if the file does not exist yet
+        (first run) or is malformed.
+        """
         if not os.path.exists(self._path):
             return {}
         try:
             with open(self._path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # Validate structure: must be dict[str, list[str]]
             if isinstance(data, dict):
                 return {
                     k: v for k, v in data.items()
@@ -148,45 +224,83 @@ class PasswordRegistry:
         return {}
 
     def _save(self) -> None:
+        """
+        Write the current in-memory store to disk atomically.
+
+        Uses temp-file + os.replace():
+          1. Write to registry.json.tmp
+          2. os.replace() swaps it in atomically
+        This guarantees the file is never left in a half-written state.
+
+        Called inside the lock — caller must hold self._lock.
+        """
         tmp_path = self._path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self._store, f, indent=2)
-            os.replace(tmp_path, self._path)
+            os.replace(tmp_path, self._path)     # atomic on POSIX and Windows
         except OSError as e:
+            # Non-fatal: in-memory state remains correct.
+            # Log the error but do not crash the environment.
             print(
                 f"[PasswordRegistry] WARNING: could not save registry to "
                 f"{self._path}: {e}",
                 flush=True,
             )
 
+    # ── Public API ────────────────────────────────────────────────
+
     def is_duplicate(self, person_id: str, password: str) -> bool:
+        """
+        Check if this person has already successfully submitted this password.
+
+        1. Hash plaintext → SHA-256 hex
+        2. Retrieve person's sorted hash list (from memory, not disk)
+        3. Binary search — O(log n)
+        """
         pw_hash = hash_password(password)
         with self._lock:
             history = list(self._store.get(person_id, []))
         return binary_search(history, pw_hash)
 
     def register(self, person_id: str, password: str) -> None:
+        """
+        Store a successful password hash for a person.
+
+        1. Hash plaintext → SHA-256 hex
+        2. Append to person's in-memory list
+        3. Re-sort using parallel_merge_sort (keeps binary search valid)
+        4. Write entire registry to registry.json atomically
+
+        Idempotent — re-registering the same password is safe.
+        is_duplicate() is called upstream to prevent it, but _save()
+        is stable regardless.
+        """
         pw_hash = hash_password(password)
         with self._lock:
             current = self._store.get(person_id, [])
             current.append(pw_hash)
             self._store[person_id] = parallel_merge_sort(current)
-            self._save()
+            self._save()    # ← persist to disk inside the lock
 
     def person_count(self, person_id: str) -> int:
+        """Number of unique hashed passwords stored for this person."""
         with self._lock:
             return len(self._store.get(person_id, []))
 
     def total_stored(self) -> int:
+        """Total hashed passwords across all persons."""
         with self._lock:
             return sum(len(v) for v in self._store.values())
 
     @property
     def storage_path(self) -> str:
+        """Absolute path of the JSON registry file."""
         return os.path.abspath(self._path)
 
 
+# Singleton registry — shared across all episodes on this server process.
+# Loads any previously stored hashes from registry.json on startup.
 _REGISTRY = PasswordRegistry()
 
 
@@ -198,9 +312,9 @@ MIN_LEN        = 5
 MAX_LEN        = 7
 VALID_SYMBOLS  = set("@#$%")
 ALLOWED_FIRST  = set(string.ascii_letters + "_")
-RULE_WEIGHT    = 0.20
+RULE_WEIGHT    = 0.20       # each of the 5 rules contributes equally
 
-DUPLICATE_PENALTY = 0.30
+DUPLICATE_PENALTY = 0.30    # deducted from raw reward on duplicate submission
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -208,6 +322,7 @@ DUPLICATE_PENALTY = 0.30
 # ═════════════════════════════════════════════════════════════════
 
 def _score_length(pw: str) -> float:
+    """Rule 1: Length must be 5–7 characters."""
     n = len(pw)
     if n == 0:
         return 0.0
@@ -219,12 +334,14 @@ def _score_length(pw: str) -> float:
 
 
 def _score_case_mix(pw: str) -> float:
+    """Rule 2: Must have at least one uppercase and one lowercase letter."""
     has_upper = any(c.isupper() for c in pw)
     has_lower = any(c.islower() for c in pw)
     return (0.5 if has_upper else 0.0) + (0.5 if has_lower else 0.0)
 
 
 def _score_digits(pw: str) -> float:
+    """Rule 3: At least one digit, but not all digits."""
     if not pw:
         return 0.0
     n_digits   = sum(c.isdigit() for c in pw)
@@ -235,9 +352,10 @@ def _score_digits(pw: str) -> float:
 
 
 def _score_symbols(pw: str) -> float:
+    """Rule 4: At least one symbol from {@ # $ %}, but not all symbols."""
     if not pw:
         return 0.0
-    n_sym   = sum(c in VALID_SYMBOLS for c in pw)
+    n_sym  = sum(c in VALID_SYMBOLS for c in pw)
     all_sym = all(c in VALID_SYMBOLS for c in pw)
     if all_sym:
         return 0.0
@@ -245,6 +363,7 @@ def _score_symbols(pw: str) -> float:
 
 
 def _score_first_char(pw: str) -> float:
+    """Rule 5: First character must be a letter or underscore."""
     if not pw:
         return 0.0
     return 1.0 if pw[0] in ALLOWED_FIRST else 0.0
@@ -259,8 +378,19 @@ def compute_reward(
     step: int,
     person_id: str,
 ) -> Reward:
+    """
+    Compute reward for a submitted password.
+
+    Pipeline:
+      1. Check registry for duplicate (REQ 1 & 2)
+      2. Compute per-rule scores
+      3. Apply duplicate penalty if needed (REQ 2)
+      4. Return Reward with full breakdown (internal) + final value
+    """
+    # ── Duplicate check ──────────────────────────────────────────
     is_dup = _REGISTRY.is_duplicate(person_id, password)
 
+    # ── Rule scores ──────────────────────────────────────────────
     r1 = _score_length(password)
     r2 = _score_case_mix(password)
     r3 = _score_digits(password)
@@ -276,10 +406,10 @@ def compute_reward(
     }
 
     raw_total = RULE_WEIGHT * (r1 + r2 + r3 + r4 + r5)
-    penalty   = DUPLICATE_PENALTY if is_dup else 0.0
 
-    # Clamp strictly to (0, 1) — validator rejects exactly 0.0 or 1.0
-    final = _clamp(round(raw_total - penalty, 4))
+    # ── Duplicate penalty (REQ 2) ─────────────────────────────────
+    penalty = DUPLICATE_PENALTY if is_dup else 0.0
+    final   = round(max(0.0, min(1.0, raw_total - penalty)), 4)
 
     return Reward(
         value=final,
@@ -292,14 +422,14 @@ def compute_reward(
 
 # ═════════════════════════════════════════════════════════════════
 # TASK GRADERS
-# Must return float strictly in (0, 1) — never 0.0 or 1.0
+# Deterministic, no LLM calls, return float in [0.0, 1.0].
 # ═════════════════════════════════════════════════════════════════
 
 def grade_easy(history: list[AttemptRecord]) -> float:
     """Easy: score of the first submission."""
     if not history:
         return 0.001
-    return _clamp(history[0].reward)
+    return max(0.001, min(0.999, history[0].reward))
 
 
 def grade_medium(history: list[AttemptRecord]) -> float:
@@ -308,6 +438,7 @@ def grade_medium(history: list[AttemptRecord]) -> float:
       best reward achieved (60%) +
       improvement from first to best (20%) +
       step efficiency (20%).
+    Duplicate attempts reduce score because they waste steps.
     """
     if not history:
         return 0.001
@@ -317,7 +448,7 @@ def grade_medium(history: list[AttemptRecord]) -> float:
     best_step    = next(i + 1 for i, r in enumerate(history) if r.reward == best_reward)
     efficiency   = 1.0 - ((best_step - 1) / 10)
     score = (0.60 * best_reward) + (0.20 * improvement) + (0.20 * efficiency)
-    return _clamp(round(score, 4))
+    return round(min(0.999, max(0.001, score)), 4)
 
 
 def grade_hard(history: list[AttemptRecord]) -> float:
@@ -325,18 +456,20 @@ def grade_hard(history: list[AttemptRecord]) -> float:
     Hard: bonus structure for reaching perfect score.
       Perfect achieved → 0.50 + 0.30 + 0.20 × efficiency
       Otherwise        → 0.50 × best_reward + 0.20 × efficiency
+    Duplicate penalties visible in history reduce best_reward,
+    making this task harder for agents that repeat submissions.
     """
     if not history:
         return 0.001
-    best_reward     = max(r.reward for r in history)
-    reached_perfect = any(r.reward >= 0.999 for r in history)
-    best_step       = next(i + 1 for i, r in enumerate(history) if r.reward == best_reward)
-    efficiency      = 1.0 - ((best_step - 1) / 10)
+    best_reward    = max(r.reward for r in history)
+    reached_perfect = any(r.reward >= 1.0 for r in history)
+    best_step      = next(i + 1 for i, r in enumerate(history) if r.reward == best_reward)
+    efficiency     = 1.0 - ((best_step - 1) / 10)
     if reached_perfect:
         score = 0.50 + 0.30 + (0.20 * efficiency)
     else:
         score = (0.50 * best_reward) + (0.20 * efficiency)
-    return _clamp(round(score, 4))
+    return round(min(0.999, max(0.001, score)), 4)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -397,15 +530,17 @@ class PasswordPolicyEnvironment:
             raise ValueError(
                 f"Unknown task '{task}'. Valid: {list(TASK_CONFIGS)}"
             )
-        self._task        = task
-        self._config      = TASK_CONFIGS[task]
-        self._person_id   = "default"
-        self._history:    list[AttemptRecord] = []
+        self._task      = task
+        self._config    = TASK_CONFIGS[task]
+        self._person_id = "default"
+        self._history:  list[AttemptRecord] = []
         self._step_count  = 0
         self._max_steps   = self._config["max_steps"]
         self._done        = False
         self._last_reward: Reward | None = None
         self._last_password = self._config["starting_password"]
+
+    # ── OpenEnv required methods ──────────────────────────────────
 
     def reset(self, person_id: str = "default") -> Observation:
         """Initialise a fresh episode for the given person."""
@@ -452,12 +587,17 @@ class PasswordPolicyEnvironment:
         self._step_count += 1
         password = action.password
 
+        # ── Compute reward (includes duplicate check) ─────────────
         reward = compute_reward(password, self._step_count, self._person_id)
 
+        # ── Register successful passwords (REQ 2) ─────────────────
+        # A password is "successful" if it scores >= 0.8 raw AND is not a dup.
+        # We store before penalty so the registry reflects genuine achievements.
         raw_score = RULE_WEIGHT * sum(reward.rule_scores.values())
         if raw_score >= 0.80 and not reward.is_duplicate:
             _REGISTRY.register(self._person_id, password)
 
+        # ── Record attempt ────────────────────────────────────────
         record = AttemptRecord(
             step=self._step_count,
             password=password,
@@ -468,19 +608,20 @@ class PasswordPolicyEnvironment:
         self._last_password = password
         self._last_reward   = reward
 
-        # Use 0.999 threshold since 1.0 is clamped away
-        done = (reward.value >= 0.999) or (self._step_count >= self._max_steps)
+        # ── Done conditions ───────────────────────────────────────
+        done = (reward.value >= 1.0) or (self._step_count >= self._max_steps)
         self._done = done
 
         best_so_far = max(r.reward for r in self._history)
 
+        # ── Message ───────────────────────────────────────────────
         if reward.is_duplicate:
             msg = (
                 f"⚠ DUPLICATE PASSWORD — penalty -{DUPLICATE_PENALTY:.2f} applied. "
                 f"Reward after penalty: {reward.value:.2f}. "
                 "Each person may only use each password once."
             )
-        elif reward.value >= 0.999:
+        elif reward.value >= 1.0:
             msg = "✓ Perfect score! All policy rules satisfied. Episode complete."
         elif done:
             msg = f"Step budget exhausted. Best reward: {best_so_far:.2f}."
@@ -504,13 +645,13 @@ class PasswordPolicyEnvironment:
         )
 
         info = {
-            "task_name":                self._config["name"],
-            "step":                     self._step_count,
-            "done":                     done,
-            "was_duplicate":            reward.is_duplicate,
-            "penalty_applied":          reward.penalty_applied,
+            "task_name":         self._config["name"],
+            "step":              self._step_count,
+            "done":              done,
+            "was_duplicate":     reward.is_duplicate,
+            "penalty_applied":   reward.penalty_applied,
             "raw_score_before_penalty": round(raw_score, 4),
-            "registry_size":            _REGISTRY.total_stored(),
+            "registry_size":     _REGISTRY.total_stored(),
         }
 
         return obs, reward, done, info
