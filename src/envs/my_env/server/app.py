@@ -22,7 +22,7 @@ from models import Observation, Action
 from server.environment import PasswordPolicyEnvironment
 
 
-# ── App ───────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Password Policy Environment",
@@ -36,21 +36,27 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# ── Global environment instance ───────────────────────────────────
+# ── Global environment instance ───────────────────────────────────────────────
 _env: PasswordPolicyEnvironment | None = None
 _current_person_id: str = "default"
 
 
-# ── Request schemas ───────────────────────────────────────────────
+# ── Helper: clamp score to strictly (0.001, 0.999) ───────────────────────────
+def clamp_score(score: float) -> float:
+    """Ensure score is strictly between 0 and 1 — never exactly 0.0 or 1.0."""
+    return round(max(0.001, min(0.999, float(score))), 4)
+
+
+# ── Request schemas ───────────────────────────────────────────────────────────
 
 class ResetRequest(BaseModel):
-    task:      str = "hard"       # "easy" | "medium" | "hard"
-    person_id: str = "default"    # unique agent/user identifier
+    task:      str = "hard"
+    person_id: str = "default"
 
 
 class StepRequest(BaseModel):
-    person_id: str                # must match person_id from reset
-    password:  str                # candidate password to evaluate
+    person_id: str
+    password:  str
 
 
 class StepResponse(BaseModel):
@@ -58,10 +64,10 @@ class StepResponse(BaseModel):
     reward:      float
     done:        bool
     info:        dict
-    grade:       float            # current episode grade (0.0–1.0)
+    grade:       float
 
 
-# ── Endpoints ─────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -125,6 +131,7 @@ def step(request: StepRequest):
         hashes in the registry using parallel merge sort
 
     Returns the observation, reward, done flag, and current grade.
+    All scores are clamped to strictly (0.001, 0.999).
     """
     global _env
     if _env is None:
@@ -133,12 +140,14 @@ def step(request: StepRequest):
             detail="Environment not initialised. Call POST /reset first.",
         )
     try:
-        action   = Action(person_id=request.person_id, password=request.password)
+        action          = Action(person_id=request.person_id, password=request.password)
         obs, reward, done, info = _env.step(action)
-        grade    = _env.grade()
+        # FIX: clamp reward and grade to strictly (0.001, 0.999)
+        reward_value    = clamp_score(reward.value)
+        grade           = clamp_score(_env.grade())
         return StepResponse(
             observation=obs,
-            reward=reward.value,
+            reward=reward_value,
             done=done,
             info=info,
             grade=grade,
@@ -182,3 +191,15 @@ def registry():
             "Sorted via parallel merge sort for O(log n) binary search."
         ),
     }
+
+
+@app.get("/grade")
+def grade():
+    """
+    Return the current episode grade strictly in (0.001, 0.999).
+    Called by the hackathon validator to score the episode.
+    """
+    global _env
+    if _env is None:
+        return {"grade": 0.001}
+    return {"grade": clamp_score(_env.grade())}
