@@ -409,7 +409,7 @@ def compute_reward(
 
     # ── Duplicate penalty (REQ 2) ─────────────────────────────────
     penalty = DUPLICATE_PENALTY if is_dup else 0.0
-    final   = round(max(0.0, min(1.0, raw_total - penalty)), 4)
+    final = round(max(0.001, min(0.999, raw_total - penalty)), 4)
 
     return Reward(
         value=final,
@@ -429,7 +429,8 @@ def grade_easy(history: list[AttemptRecord]) -> float:
     """Easy: score of the first submission."""
     if not history:
         return 0.001
-    return max(0.001, min(0.999, history[0].reward))
+    # FIX: clamp to (0.001, 0.999)
+    return round(max(0.001, min(0.999, history[0].reward)), 4)
 
 
 def grade_medium(history: list[AttemptRecord]) -> float:
@@ -609,7 +610,7 @@ class PasswordPolicyEnvironment:
         self._last_reward   = reward
 
         # ── Done conditions ───────────────────────────────────────
-        done = (reward.value >= 1.0) or (self._step_count >= self._max_steps)
+        done = (reward.value >= 0.999) or (self._step_count >= self._max_steps)
         self._done = done
 
         best_so_far = max(r.reward for r in self._history)
