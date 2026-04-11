@@ -2,9 +2,9 @@
 inference.py — Improved agent for the Password Policy Environment.
 
 Environment variables (injected by hackathon proxy):
-  API_BASE_URL   — LLM API endpoint (provided by hackathon)
+  API_BASE_URL   — LLM API endpoint (default: https://api.groq.com/openai/v1)
   API_KEY        — API key (provided by hackathon)
-  MODEL_NAME     — model identifier
+  MODEL_NAME     — model identifier (default: llama-3.3-70b-versatile)
   ENV_BASE_URL   — Password env server URL (default: http://localhost:7860)
 
 stdout format (mandatory — zero deviation):
