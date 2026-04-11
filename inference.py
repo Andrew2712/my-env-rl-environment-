@@ -1,14 +1,14 @@
 """
 inference.py — Improved agent for the Password Policy Environment.
 
-Environment variables:
-  API_BASE_URL   — LLM API endpoint (default: https://api.groq.com/openai/v1)
-  MODEL_NAME     — model identifier  (default: llama-3.3-70b-versatile)
-  HF_TOKEN       — Hugging Face bearer token
+Environment variables (injected by hackathon proxy):
+  API_BASE_URL   — LLM API endpoint (provided by hackathon)
+  API_KEY        — API key (provided by hackathon)
+  MODEL_NAME     — model identifier
   ENV_BASE_URL   — Password env server URL (default: http://localhost:7860)
 
 stdout format (mandatory — zero deviation):
-  [START] task=<n> env=password-policy-env model=<model>
+  [START] task=<name> env=password-policy-env model=<model>
   [STEP]  step=<n> action=<password> reward=<0.00> done=<true|false> error=<msg|null>
   [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
 """
@@ -25,25 +25,26 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_DIR  = os.path.join(BASE_DIR, "src", "envs", "my_env")
 sys.path.insert(0, ENV_DIR)
 
-# ── Configuration — read fresh so env vars set before run are always picked up ─
+# ── Configuration — read fresh every call so injected env vars are picked up ──
 def get_config():
     return {
-        "API_BASE_URL": os.environ.get("API_BASE_URL", "https://api.groq.com/openai/v1"),
-        "MODEL_NAME":   os.environ.get("MODEL_NAME",   "llama-3.3-70b-versatile"),
-        "HF_TOKEN":     os.environ.get("HF_TOKEN",     ""),
+        "API_BASE_URL": os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1"),
+        # Hackathon injects API_KEY — fall back to HF_TOKEN for local testing
+        "API_KEY":      os.environ.get("API_KEY") or os.environ.get("HF_TOKEN", ""),
+        "MODEL_NAME":   os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct"),
         "ENV_BASE_URL": os.environ.get("ENV_BASE_URL", "http://localhost:7860"),
     }
 
 TASKS     = ["easy", "medium", "hard"]
 MAX_STEPS = 10
 
-# ── OpenAI client — created fresh at startup so env vars are always respected ──
+# ── OpenAI client — uses API_BASE_URL + API_KEY as required by hackathon ──────
 def make_llm():
     cfg = get_config()
     try:
         from openai import OpenAI
-        token  = cfg["HF_TOKEN"] if cfg["HF_TOKEN"] else "dummy-token"
-        client = OpenAI(base_url=cfg["API_BASE_URL"], api_key=token)
+        api_key = cfg["API_KEY"] if cfg["API_KEY"] else "dummy-token"
+        client  = OpenAI(base_url=cfg["API_BASE_URL"], api_key=api_key)
         return client, cfg["MODEL_NAME"]
     except Exception as e:
         print(f"[WARN] LLM init failed: {e}", flush=True)
@@ -125,14 +126,12 @@ def build_prompt(obs: dict, step: int, episode_history: list) -> str:
     left    = obs.get("steps_remaining", 0)
     last_pw = obs.get("last_password", "")
 
-    # Find the best password seen so far to anchor from
     best_entry = max(episode_history, key=lambda h: h["reward"]) if episode_history else None
     best_pw_info = (
         f"Best password so far: '{best_entry['password']}' (reward={best_entry['reward']:.2f})"
         if best_entry else "No attempts yet"
     )
 
-    # Smart contextual hint based on current reward
     rules_done = round(last_r / 0.2) if last_r > 0 else 0
     rules_left = 5 - rules_done
     if last_r >= 1.0:
@@ -148,7 +147,6 @@ def build_prompt(obs: dict, step: int, episode_history: list) -> str:
     else:
         hint = f"{rules_left} rules left. Keep isolating changes. Always start from your best password."
 
-    # Include duplicate warning if injected
     dup_warning = obs.get("_duplicate_warning", "")
     dup_section = f"\nWARNING: {dup_warning}\n" if dup_warning else ""
 
@@ -171,13 +169,9 @@ def build_prompt(obs: dict, step: int, episode_history: list) -> str:
 
 
 def clean_llm_response(raw: str) -> dict:
-    """
-    Robustly extract JSON from LLM output, handling markdown fences,
-    extra text before/after the JSON, and other common issues.
-    """
+    """Robustly extract JSON from LLM output."""
     raw = raw.strip()
 
-    # Strip markdown code fences
     if raw.startswith("```"):
         parts = raw.split("```")
         for part in parts[1:]:
@@ -186,7 +180,6 @@ def clean_llm_response(raw: str) -> dict:
                 raw = cleaned
                 break
 
-    # Strip any text before the first '{' and after the last '}'
     brace_start = raw.find("{")
     brace_end   = raw.rfind("}")
     if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
@@ -208,9 +201,9 @@ def get_agent_action(
     Falls back ONLY when LLM truly fails after all retries.
     """
     submitted   = {h["password"] for h in episode_history}
-    current_obs = obs  # may be shadowed on duplicate warning injection
+    current_obs = obs
 
-    # ── LLM path (up to 3 retries on parse/duplicate failures) ────────────────
+    # ── LLM path (up to 3 retries) ────────────────────────────────────────────
     if llm is not None:
         last_llm_error = None
 
@@ -255,7 +248,7 @@ def get_agent_action(
             except Exception as e:
                 last_llm_error = f"LLM call error: {e}"
                 print(f"[WARN] attempt={attempt+1} LLM call failed: {e}", flush=True)
-                break  # Network/auth errors won't resolve on retry
+                break
 
         print(
             f"[WARN] All LLM attempts failed. Last error: {last_llm_error}. Using fallback.",
@@ -270,23 +263,19 @@ def get_agent_action(
     lengths  = [5, 6, 7, 8]
     fallback_candidates = []
 
-    # 1. Symbol variants of best password
     for sym in symbols:
         mutated = re.sub(r"[@#$%]", sym, best_pw)
         fallback_candidates.append(mutated if mutated != best_pw else best_pw + sym)
 
-    # 2. Length variants
     for length in lengths:
         if len(best_pw) < length:
             fallback_candidates.append(best_pw + "a" * (length - len(best_pw)))
         elif len(best_pw) > length:
             fallback_candidates.append(best_pw[:length])
 
-    # 3. First-character variants
     fallback_candidates.append("_" + best_pw)
     fallback_candidates.append("A" + best_pw[1:] if len(best_pw) > 1 else "A" + best_pw)
 
-    # 4. Static diverse seeds (last resort)
     fallback_candidates += [
         "Ab1@xy", "Ab1#xy", "Ab1$xy", "Ab1%xy",
         "_Ab1@x", "Ab1@x",  "Ab1@xyz", "Ab1@xyzw",
@@ -298,7 +287,6 @@ def get_agent_action(
         if pw not in submitted:
             return pw, "fallback"
 
-    # Absolute last resort: random generation
     while True:
         pw = (
             random.choice(string.ascii_uppercase) +
@@ -318,7 +306,7 @@ def run_episode(task: str, person_id: str, llm, model_name: str) -> None:
     steps_taken:     int         = 0
     success:         bool        = False
     error_msg:       str         = "null"
-    episode_history: list        = []   # reset per episode
+    episode_history: list        = []
 
     print(
         f"[START] task={task} env=password-policy-env model={model_name}",
@@ -407,7 +395,6 @@ def run_episode(task: str, person_id: str, llm, model_name: str) -> None:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Create LLM client once at startup — env vars are read here
     llm, model_name = make_llm()
     cfg = get_config()
     print(f"[INFO] model={model_name} api={cfg['API_BASE_URL']}", flush=True)
