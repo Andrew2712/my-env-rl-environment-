@@ -409,7 +409,7 @@ def compute_reward(
 
     # ── Duplicate penalty (REQ 2) ─────────────────────────────────
     penalty = DUPLICATE_PENALTY if is_dup else 0.0
-    final = round(max(0.001, min(0.999, raw_total - penalty)), 4)
+    final   = round(max(0.001, min(0.999, raw_total - penalty)), 4)
 
     return Reward(
         value=final,
@@ -429,8 +429,7 @@ def grade_easy(history: list[AttemptRecord]) -> float:
     """Easy: score of the first submission."""
     if not history:
         return 0.001
-    # FIX: clamp to (0.001, 0.999)
-    return round(max(0.001, min(0.999, history[0].reward)), 4)
+    return max(0.001, min(0.999, history[0].reward))
 
 
 def grade_medium(history: list[AttemptRecord]) -> float:
@@ -463,7 +462,7 @@ def grade_hard(history: list[AttemptRecord]) -> float:
     if not history:
         return 0.001
     best_reward    = max(r.reward for r in history)
-    reached_perfect = any(r.reward >= 1.0 for r in history)
+    reached_perfect = any(r.reward >= 0.999 for r in history)
     best_step      = next(i + 1 for i, r in enumerate(history) if r.reward == best_reward)
     efficiency     = 1.0 - ((best_step - 1) / 10)
     if reached_perfect:
@@ -622,7 +621,7 @@ class PasswordPolicyEnvironment:
                 f"Reward after penalty: {reward.value:.2f}. "
                 "Each person may only use each password once."
             )
-        elif reward.value >= 1.0:
+        elif reward.value >= 0.999:
             msg = "✓ Perfect score! All policy rules satisfied. Episode complete."
         elif done:
             msg = f"Step budget exhausted. Best reward: {best_so_far:.2f}."
@@ -703,5 +702,3 @@ class PasswordPolicyEnvironment:
     def close(self) -> None:
         """No-op — satisfies OpenEnv spec close() requirement."""
         pass
-
-
