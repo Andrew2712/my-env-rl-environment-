@@ -1,14 +1,14 @@
 """
-inference.py — Improved agent for the Password Policy Environment.
+inference.py — Agent for the Password Policy Environment.
 
 Environment variables (injected by hackathon proxy):
-  API_BASE_URL   — LLM API endpoint (default: https://api.groq.com/openai/v1)
-  API_KEY        — API key (provided by hackathon)
-  MODEL_NAME     — model identifier (default: llama-3.3-70b-versatile)
+  API_BASE_URL   — LLM API endpoint (injected by hackathon)
+  API_KEY        — API key (injected by hackathon)
+  MODEL_NAME     — model identifier
   ENV_BASE_URL   — Password env server URL (default: http://localhost:7860)
 
 stdout format (mandatory — zero deviation):
-  [START] task=<name> env=password-policy-env model=<model>
+  [START] task=<n> env=password-policy-env model=<model>
   [STEP]  step=<n> action=<password> reward=<0.00> done=<true|false> error=<msg|null>
   [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
 """
@@ -25,30 +25,25 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_DIR  = os.path.join(BASE_DIR, "src", "envs", "my_env")
 sys.path.insert(0, ENV_DIR)
 
-# ── Configuration — read fresh every call so injected env vars are picked up ──
-def get_config():
-    return {
-        "API_BASE_URL": os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1"),
-        # Hackathon injects API_KEY — fall back to HF_TOKEN for local testing
-        "API_KEY":      os.environ.get("API_KEY") or os.environ.get("HF_TOKEN", ""),
-        "MODEL_NAME":   os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct"),
-        "ENV_BASE_URL": os.environ.get("ENV_BASE_URL", "http://localhost:7860"),
-    }
+# ── Configuration — exactly as required by hackathon ──────────────────────────
+# API_BASE_URL and API_KEY are injected by the hackathon LiteLLM proxy
+API_BASE_URL = os.environ["API_BASE_URL"]
+API_KEY      = os.environ["API_KEY"]
+MODEL_NAME   = os.environ.get("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
+ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "http://localhost:7860")
 
 TASKS     = ["easy", "medium", "hard"]
 MAX_STEPS = 10
 
-# ── OpenAI client — uses API_BASE_URL + API_KEY as required by hackathon ──────
+# ── OpenAI client — uses API_BASE_URL + API_KEY exactly as injected ───────────
 def make_llm():
-    cfg = get_config()
     try:
         from openai import OpenAI
-        api_key = cfg["API_KEY"] if cfg["API_KEY"] else "dummy-token"
-        client  = OpenAI(base_url=cfg["API_BASE_URL"], api_key=api_key)
-        return client, cfg["MODEL_NAME"]
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+        return client
     except Exception as e:
         print(f"[WARN] LLM init failed: {e}", flush=True)
-        return None, cfg["MODEL_NAME"]
+        return None
 
 
 def get_env_client():
@@ -193,7 +188,6 @@ def get_agent_action(
     step: int,
     episode_history: list,
     llm,
-    model_name: str,
 ) -> tuple[str, str]:
     """
     Call LLM with full trajectory context.
@@ -211,7 +205,7 @@ def get_agent_action(
             try:
                 prompt = build_prompt(current_obs, step, episode_history)
                 resp   = llm.chat.completions.create(
-                    model=model_name,
+                    model=MODEL_NAME,
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user",   "content": prompt},
@@ -301,7 +295,7 @@ def get_agent_action(
 
 # ── Episode runner ─────────────────────────────────────────────────────────────
 
-def run_episode(task: str, person_id: str, llm, model_name: str) -> None:
+def run_episode(task: str, person_id: str, llm) -> None:
     rewards:         list[float] = []
     steps_taken:     int         = 0
     success:         bool        = False
@@ -309,11 +303,9 @@ def run_episode(task: str, person_id: str, llm, model_name: str) -> None:
     episode_history: list        = []
 
     print(
-        f"[START] task={task} env=password-policy-env model={model_name}",
+        f"[START] task={task} env=password-policy-env model={MODEL_NAME}",
         flush=True,
     )
-
-    cfg = get_config()
 
     try:
         PasswordEnvClient = get_env_client()
@@ -322,7 +314,7 @@ def run_episode(task: str, person_id: str, llm, model_name: str) -> None:
         return
 
     try:
-        with PasswordEnvClient(base_url=cfg["ENV_BASE_URL"]) as env:
+        with PasswordEnvClient(base_url=ENV_BASE_URL) as env:
             try:
                 obs_obj = env.reset(task=task, person_id=person_id)
                 obs     = obs_obj.model_dump()
@@ -330,7 +322,7 @@ def run_episode(task: str, person_id: str, llm, model_name: str) -> None:
                 for step in range(1, MAX_STEPS + 1):
                     try:
                         password, action_source = get_agent_action(
-                            obs, step, episode_history, llm, model_name
+                            obs, step, episode_history, llm
                         )
                         error_msg = "null"
                     except Exception as e:
@@ -395,15 +387,13 @@ def run_episode(task: str, person_id: str, llm, model_name: str) -> None:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    llm, model_name = make_llm()
-    cfg = get_config()
-    print(f"[INFO] model={model_name} api={cfg['API_BASE_URL']}", flush=True)
+    print(f"[INFO] model={MODEL_NAME} api={API_BASE_URL}", flush=True)
+    llm = make_llm()
 
     for task in TASKS:
         run_episode(
             task=task,
             person_id=f"baseline_agent_{task}",
             llm=llm,
-            model_name=model_name,
         )
         print(flush=True)
