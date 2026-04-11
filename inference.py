@@ -1,14 +1,14 @@
 """
-inference.py — Agent for the Password Policy Environment.
+inference.py — Baseline agent for the Password Policy Environment.
 
-Environment variables (injected by hackathon proxy):
-  API_BASE_URL   — LLM API endpoint (injected by hackathon)
-  API_KEY        — API key (injected by hackathon)
-  MODEL_NAME     — model identifier
+Environment variables:
+  API_BASE_URL   — LLM API endpoint (default: https://router.huggingface.co/v1)
+  MODEL_NAME     — model identifier  (default: Qwen/Qwen2.5-72B-Instruct)
+  HF_TOKEN       — Hugging Face bearer token
   ENV_BASE_URL   — Password env server URL (default: http://localhost:7860)
 
 stdout format (mandatory — zero deviation):
-  [START] task=<n> env=password-policy-env model=<model>
+  [START] task=<name> env=password-policy-env model=<model>
   [STEP]  step=<n> action=<password> reward=<0.00> done=<true|false> error=<msg|null>
   [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
 """
@@ -16,35 +16,38 @@ stdout format (mandatory — zero deviation):
 import os
 import sys
 import json
-import random
-import string
-import re
 
 # ── Fix import paths ───────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_DIR  = os.path.join(BASE_DIR, "src", "envs", "my_env")
 sys.path.insert(0, ENV_DIR)
 
-# ── Configuration — exactly as required by hackathon ──────────────────────────
-# API_BASE_URL and API_KEY are injected by the hackathon LiteLLM proxy
-API_BASE_URL = os.environ["API_BASE_URL"]
-API_KEY      = os.environ["API_KEY"]
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN     = os.environ.get("HF_TOKEN",     "")
 ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "http://localhost:7860")
 
 TASKS     = ["easy", "medium", "hard"]
 MAX_STEPS = 10
 
-# ── OpenAI client — uses API_BASE_URL + API_KEY exactly as injected ───────────
-def make_llm():
+# ── Lazy OpenAI client ─────────────────────────────────────────────────────────
+
+_llm = None
+
+def get_llm():
+    global _llm
+    if _llm is not None:
+        return _llm
     try:
         from openai import OpenAI
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-        return client
+        token = HF_TOKEN if HF_TOKEN else "dummy-token"
+        _llm  = OpenAI(base_url=API_BASE_URL, api_key=token)
     except Exception as e:
         print(f"[WARN] LLM init failed: {e}", flush=True)
-        return None
-
+        _llm = None
+    return _llm
 
 def get_env_client():
     try:
@@ -52,7 +55,6 @@ def get_env_client():
         return PasswordEnvClient
     except Exception as e:
         raise RuntimeError(f"Could not import PasswordEnvClient: {e}")
-
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 
@@ -74,7 +76,7 @@ REASONING PROTOCOL — follow this exactly:
 6. If reward = 1.00: done!
 
 DIMENSIONS TO EXPLORE (change ONE at a time):
-- Length: try 5, 6, 7, 8 characters
+- Length: try 5, 6, 7 characters
 - Uppercase: include A-Z
 - Lowercase: include a-z
 - Digit: include 0-9
@@ -86,12 +88,9 @@ NEVER:
 - Change more than one thing at a time
 - Use symbols outside @#$%
 
-CRITICAL OUTPUT RULES:
-- Output ONLY a JSON object. No markdown. No explanation outside the JSON.
-- The JSON must have exactly two keys: "password" and "reasoning"
-- Example: {"password": "Ab1@xy", "reasoning": "Added digit to test digit rule"}
+OUTPUT — JSON only, no markdown:
+{"password": "...", "reasoning": "what changed and why"}
 """
-
 
 def build_prompt(obs: dict, step: int, episode_history: list) -> str:
     """Build a rich prompt showing the full reward trajectory."""
@@ -116,191 +115,105 @@ def build_prompt(obs: dict, step: int, episode_history: list) -> str:
 
     history_str = "\n".join(lines) if lines else "  (none yet)"
 
-    best    = obs.get("best_reward_so_far", 0.0)
-    last_r  = obs.get("last_reward", 0.0)
-    left    = obs.get("steps_remaining", 0)
+    best   = obs.get("best_reward_so_far", 0.0)
+    last_r = obs.get("last_reward", 0.0)
+    left   = obs.get("steps_remaining", 0)
     last_pw = obs.get("last_password", "")
 
-    best_entry = max(episode_history, key=lambda h: h["reward"]) if episode_history else None
-    best_pw_info = (
-        f"Best password so far: '{best_entry['password']}' (reward={best_entry['reward']:.2f})"
-        if best_entry else "No attempts yet"
-    )
-
-    rules_done = round(last_r / 0.2) if last_r > 0 else 0
-    rules_left = 5 - rules_done
+    # Smart contextual hint based on current reward
+    rules_done   = round(last_r / 0.2) if last_r > 0 else 0
+    rules_left   = 5 - rules_done
     if last_r >= 1.0:
         hint = "Already perfect! (should be done)"
     elif last_r == 0.8:
-        hint = "ONE rule left. Try changing ONE thing: symbol (@#$%), length, or first character."
+        hint = "ONE rule left. Most likely: try adding symbol @, then #, then $, then %. Or check first character is letter/_."
     elif last_r == 0.6:
-        hint = "TWO rules left. Fix one dimension at a time. Start from your best password."
+        hint = "TWO rules left. Fix one dimension at a time."
     elif last_r == 0.4:
         hint = "THREE rules left. Start with a broader password covering more dimensions."
     elif last_r == 0.0:
-        hint = "No rules passing yet. Use a diverse starting password like Ab1@xy."
+        hint = "No rules passing yet. Use a diverse starting password."
     else:
-        hint = f"{rules_left} rules left. Keep isolating changes. Always start from your best password."
-
-    dup_warning = obs.get("_duplicate_warning", "")
-    dup_section = f"\nWARNING: {dup_warning}\n" if dup_warning else ""
-
-    submitted_list = [h["password"] for h in episode_history]
+        hint = f"{rules_left} rules left. Keep isolating changes."
 
     return (
-        f"=== Step {step}/{MAX_STEPS} | Steps left: {left} ===\n\n"
+        f"=== Step {step}/{MAX_STEPS} | Task | Steps left: {left} ===\n\n"
         f"Last password : '{last_pw}'\n"
         f"Last reward   : {last_r:.2f}  |  Best so far: {best:.2f}\n"
-        f"{best_pw_info}\n"
-        f"Hint          : {hint}\n"
-        f"{dup_section}\n"
+        f"Hint          : {hint}\n\n"
         f"Full reward trajectory:\n{history_str}\n\n"
         f"Rules satisfied so far: {rules_done}/5 (each worth 0.20)\n\n"
-        f"Already submitted (DO NOT repeat these): {submitted_list}\n\n"
-        "Decide your next password. Make ONE targeted change from your best password. "
-        "Output a JSON object only — no markdown, no extra text:\n"
-        '{"password": "...", "reasoning": "..."}'
+        "Decide your next password. Make ONE targeted change. Output JSON only."
     )
 
+def get_agent_action(obs: dict, step: int, episode_history: list) -> str:
+    """Call LLM with full trajectory context, fall back to rule-based search."""
+    llm = get_llm()
 
-def clean_llm_response(raw: str) -> dict:
-    """Robustly extract JSON from LLM output."""
-    raw = raw.strip()
-
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        for part in parts[1:]:
-            cleaned = part.lstrip("json").strip()
-            if cleaned:
-                raw = cleaned
-                break
-
-    brace_start = raw.find("{")
-    brace_end   = raw.rfind("}")
-    if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
-        raw = raw[brace_start : brace_end + 1]
-
-    return json.loads(raw)
-
-
-def get_agent_action(
-    obs: dict,
-    step: int,
-    episode_history: list,
-    llm,
-) -> tuple[str, str]:
-    """
-    Call LLM with full trajectory context.
-    Returns (password, source) where source is 'llm' or 'fallback'.
-    Falls back ONLY when LLM truly fails after all retries.
-    """
-    submitted   = {h["password"] for h in episode_history}
-    current_obs = obs
-
-    # ── LLM path (up to 3 retries) ────────────────────────────────────────────
     if llm is not None:
-        last_llm_error = None
+        try:
+            resp = llm.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": build_prompt(obs, step, episode_history)},
+                ],
+                max_tokens=300,
+                temperature=0.2,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                parts = raw.split("```")
+                raw   = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
+            parsed = json.loads(raw)
+            pw = str(parsed.get("password", "")).strip()
+            if pw and pw not in [h["password"] for h in episode_history]:
+                return pw
+        except Exception:
+            pass
 
-        for attempt in range(3):
-            try:
-                prompt = build_prompt(current_obs, step, episode_history)
-                resp   = llm.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user",   "content": prompt},
-                    ],
-                    max_tokens=400,
-                    temperature=0.3 + attempt * 0.15,
-                )
-                raw    = resp.choices[0].message.content.strip()
-                parsed = clean_llm_response(raw)
-                pw     = str(parsed.get("password", "")).strip()
-
-                if not pw:
-                    last_llm_error = "LLM returned empty password"
-                    print(f"[WARN] attempt={attempt+1} empty password from LLM", flush=True)
-                    continue
-
-                if pw in submitted:
-                    last_llm_error = f"LLM suggested duplicate: {pw}"
-                    print(
-                        f"[WARN] attempt={attempt+1} LLM suggested duplicate '{pw}', retrying",
-                        flush=True,
-                    )
-                    current_obs = dict(current_obs)
-                    current_obs["_duplicate_warning"] = (
-                        f"'{pw}' was already tried — pick a completely DIFFERENT password."
-                    )
-                    continue
-
-                return pw, "llm"
-
-            except json.JSONDecodeError as e:
-                last_llm_error = f"JSON parse error: {e}"
-                print(f"[WARN] attempt={attempt+1} LLM JSON parse failed: {e}", flush=True)
-            except Exception as e:
-                last_llm_error = f"LLM call error: {e}"
-                print(f"[WARN] attempt={attempt+1} LLM call failed: {e}", flush=True)
-                break
-
-        print(
-            f"[WARN] All LLM attempts failed. Last error: {last_llm_error}. Using fallback.",
-            flush=True,
-        )
-
-    # ── Smart fallback anchored on best known password ─────────────────────────
-    best_entry = max(episode_history, key=lambda h: h["reward"]) if episode_history else None
-    best_pw    = best_entry["password"] if best_entry else "Ab1@xy"
-
-    symbols  = ["@", "#", "$", "%"]
-    lengths  = [5, 6, 7, 8]
-    fallback_candidates = []
-
-    for sym in symbols:
-        mutated = re.sub(r"[@#$%]", sym, best_pw)
-        fallback_candidates.append(mutated if mutated != best_pw else best_pw + sym)
-
-    for length in lengths:
-        if len(best_pw) < length:
-            fallback_candidates.append(best_pw + "a" * (length - len(best_pw)))
-        elif len(best_pw) > length:
-            fallback_candidates.append(best_pw[:length])
-
-    fallback_candidates.append("_" + best_pw)
-    fallback_candidates.append("A" + best_pw[1:] if len(best_pw) > 1 else "A" + best_pw)
-
-    fallback_candidates += [
-        "Ab1@xy", "Ab1#xy", "Ab1$xy", "Ab1%xy",
-        "_Ab1@x", "Ab1@x",  "Ab1@xyz", "Ab1@xyzw",
-        "Bc2@yz", "Cd3#za", "De4$ab",  "Ef5%bc",
-        "Fg6@cd", "Gh7#de", "Hi8$ef",  "Ij9%fg",
+    # ── Rule-based fallback: systematic search grid ────────────────────────────
+    # Each candidate tests a specific rule dimension.
+    # Ordered from most-likely-to-succeed to least.
+    submitted = {h["password"] for h in episode_history}
+    candidates = [
+        # (password, what it tests)
+        ("Ab1@xy",  "all rules: upper+lower+digit+@+letter-start+len6"),
+        ("Ab1#xy",  "symbol # instead of @"),
+        ("Ab1$xy",  "symbol $ instead of @"),
+        ("Ab1%xy",  "symbol % instead of @"),
+        ("_Ab1@x",  "underscore first char"),
+        ("Ab1@x",   "length 5"),
+        ("Ab1@xyz",  "length 7"),
+        ("Bc2@yz",  "different base, symbol @"),
+        ("Cd3#za",  "different base, symbol #"),
+        ("De4$ab",  "different base, symbol $"),
     ]
-
-    for pw in fallback_candidates:
+    for pw, _ in candidates:
         if pw not in submitted:
-            return pw, "fallback"
+            return pw
 
+    # Last resort: generate unique variant
+    import random, string
     while True:
         pw = (
             random.choice(string.ascii_uppercase) +
             random.choice(string.ascii_lowercase) +
             str(random.randint(1, 9)) +
             random.choice("@#$%") +
-            "".join(random.choices(string.ascii_lowercase, k=random.randint(2, 4)))
+            "".join(random.choices(string.ascii_lowercase, k=2))
         )
         if pw not in submitted:
-            return pw, "fallback-random"
-
+            return pw
 
 # ── Episode runner ─────────────────────────────────────────────────────────────
 
-def run_episode(task: str, person_id: str, llm) -> None:
-    rewards:         list[float] = []
-    steps_taken:     int         = 0
-    success:         bool        = False
-    error_msg:       str         = "null"
-    episode_history: list        = []
+def run_episode(task: str, person_id: str) -> None:
+    rewards:          list[float] = []
+    steps_taken:      int         = 0
+    success:          bool        = False
+    error_msg:        str         = "null"
+    episode_history:  list        = []   # track full trajectory for LLM context
 
     print(
         f"[START] task={task} env=password-policy-env model={MODEL_NAME}",
@@ -309,7 +222,7 @@ def run_episode(task: str, person_id: str, llm) -> None:
 
     try:
         PasswordEnvClient = get_env_client()
-    except RuntimeError:
+    except RuntimeError as e:
         print(f"[END] success=false steps=0 rewards=", flush=True)
         return
 
@@ -320,16 +233,15 @@ def run_episode(task: str, person_id: str, llm) -> None:
                 obs     = obs_obj.model_dump()
 
                 for step in range(1, MAX_STEPS + 1):
+                    # Agent picks action using full episode history
                     try:
-                        password, action_source = get_agent_action(
-                            obs, step, episode_history, llm
-                        )
+                        password  = get_agent_action(obs, step, episode_history)
                         error_msg = "null"
                     except Exception as e:
-                        password      = "Ab1@xy"
-                        action_source = "exception-fallback"
-                        error_msg     = str(e).replace("\n", " ")
+                        password  = "Ab1@xy"
+                        error_msg = str(e).replace("\n", " ")
 
+                    # Environment step
                     try:
                         obs_obj, reward, done, info = env.step(
                             person_id=person_id,
@@ -342,6 +254,7 @@ def run_episode(task: str, person_id: str, llm) -> None:
                         done      = True
                         error_msg = str(e).replace("\n", " ")
 
+                    # Record in episode history for LLM context
                     was_dup = (
                         obs.get("history", [{}])[-1].get("was_duplicate", False)
                         if obs.get("history") else False
@@ -351,7 +264,6 @@ def run_episode(task: str, person_id: str, llm) -> None:
                         "password":      password,
                         "reward":        reward,
                         "was_duplicate": was_dup,
-                        "source":        action_source,
                     })
 
                     rewards.append(reward)
@@ -383,17 +295,9 @@ def run_episode(task: str, person_id: str, llm) -> None:
         flush=True,
     )
 
-
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"[INFO] model={MODEL_NAME} api={API_BASE_URL}", flush=True)
-    llm = make_llm()
-
     for task in TASKS:
-        run_episode(
-            task=task,
-            person_id=f"baseline_agent_{task}",
-            llm=llm,
-        )
+        run_episode(task=task, person_id=f"baseline_agent_{task}")
         print(flush=True)
