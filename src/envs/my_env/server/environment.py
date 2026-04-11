@@ -428,8 +428,8 @@ def compute_reward(
 def grade_easy(history: list[AttemptRecord]) -> float:
     """Easy: score of the first submission."""
     if not history:
-        return 0.0
-    return history[0].reward
+        return 0.001
+    return max(0.001, min(0.999, history[0].reward))
 
 
 def grade_medium(history: list[AttemptRecord]) -> float:
@@ -441,14 +441,14 @@ def grade_medium(history: list[AttemptRecord]) -> float:
     Duplicate attempts reduce score because they waste steps.
     """
     if not history:
-        return 0.0
+        return 0.001
     best_reward  = max(r.reward for r in history)
     first_reward = history[0].reward
     improvement  = max(0.0, best_reward - first_reward)
     best_step    = next(i + 1 for i, r in enumerate(history) if r.reward == best_reward)
     efficiency   = 1.0 - ((best_step - 1) / 10)
     score = (0.60 * best_reward) + (0.20 * improvement) + (0.20 * efficiency)
-    return round(min(1.0, max(0.0, score)), 4)
+    return round(min(0.999, max(0.001, score)), 4)
 
 
 def grade_hard(history: list[AttemptRecord]) -> float:
@@ -460,7 +460,7 @@ def grade_hard(history: list[AttemptRecord]) -> float:
     making this task harder for agents that repeat submissions.
     """
     if not history:
-        return 0.0
+        return 0.001
     best_reward    = max(r.reward for r in history)
     reached_perfect = any(r.reward >= 1.0 for r in history)
     best_step      = next(i + 1 for i, r in enumerate(history) if r.reward == best_reward)
@@ -469,7 +469,7 @@ def grade_hard(history: list[AttemptRecord]) -> float:
         score = 0.50 + 0.30 + (0.20 * efficiency)
     else:
         score = (0.50 * best_reward) + (0.20 * efficiency)
-    return round(min(1.0, max(0.0, score)), 4)
+    return round(min(0.999, max(0.001, score)), 4)
 
 
 # ═════════════════════════════════════════════════════════════════
